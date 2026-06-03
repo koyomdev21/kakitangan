@@ -80,7 +80,7 @@ Response body:
 }
 ```
 
-The preview endpoint does not create a leave request, reserve leave, or mutate balances. It exists so the frontend can show employees exactly how much leave their selected period would consume.
+The preview endpoint does not create a leave request, reserve leave, check balance availability, or mutate balances. It exists so the frontend can show employees exactly how much leave their selected period would consume.
 
 ### Review Leave Request
 
@@ -111,12 +111,12 @@ Expected status codes:
 POST /leave-requests/{leave_request_id}/cancel?employee_id=2
 ```
 
-Only the leave request owner can cancel. Pending leave can be cancelled without balance changes. Approved leave can be cancelled only before the leave start date, and cancellation restores the deducted balance.
+Only the employee who submitted the leave request can cancel through this endpoint. Pending leave can be cancelled without balance changes. Approved leave can be cancelled only before the leave start date, and cancellation restores the deducted balance. The service should derive "today" using the Malaysia timezone (`Asia/Kuala_Lumpur`), not the server's local timezone.
 
 Expected status codes:
 
 - `200 OK` when cancellation succeeds.
-- `422 Unprocessable Entity` when the employee is not the owner, the request is already rejected/cancelled, or the approved leave has started.
+- `422 Unprocessable Entity` when the employee is not the requester, the request is already rejected/cancelled, or the approved leave has started.
 - `404 Not Found` if the leave request does not exist.
 
 ### List Leave Requests
@@ -157,6 +157,8 @@ Balances are exposed in days:
 ]
 ```
 
+The API does not expose internal unit fields. Clients submit dates and sessions, and responses expose day values only.
+
 ## 2. Data Model
 
 ### employees
@@ -183,7 +185,7 @@ Leave requests should store the selected period and the calculated usage:
 - `start_session`
 - `end_date`
 - `end_session`
-- `leave_usage_days`
+- `leave_usage_units`
 - `reason`
 - `status`
 - `approved_by`
@@ -192,21 +194,34 @@ Leave requests should store the selected period and the calculated usage:
 
 `start_session` and `end_session` are enum values: `am` and `pm`.
 
-`leave_usage_days` is persisted because managers and listing screens need to show the amount of leave consumed without recalculating every row. Approval recalculates usage before deduction; if recalculated usage differs from the stored value, approval fails and the employee must resubmit.
+`leave_usage_units` is persisted as integer half-day units because managers and listing screens need to show the amount of leave consumed without recalculating every row, and integer storage avoids floating-point balance errors. The API converts units to `leave_usage_days`. Approval recalculates usage before deduction; if recalculated usage differs from the stored value, approval fails and the employee must resubmit.
+
+The storage column should be named `leave_usage_units`, not `leave_usage_days`, to avoid hiding unit-based persistence behind day-based terminology.
+
+Recommended index:
+
+- `(employee_id, status, start_date, end_date)` for overlap candidate queries.
 
 ### leave_balances
 
-Balances remain stored and exposed in days:
+Balances are stored internally as integer half-day units and exposed by the API in days:
 
 - `id`
 - `employee_id`
 - `leave_type`
 - `year`
-- `total_days`
-- `used_days`
+- `total_units`
+- `used_units`
 - timestamps
 
 Cross-year requests split usage by year. Each affected year must have a balance row for the requested leave type.
+
+The storage columns should be named `total_units` and `used_units`. Day-based fields such as `total_days`, `used_days`, and `remaining_days` are API-facing computed values.
+
+Recommended constraints and indexes:
+
+- Unique constraint on `(employee_id, leave_type, year)` to prevent duplicate yearly balances.
+- Index on `(employee_id, leave_type, year)` for balance lookup.
 
 ## 3. Leave Usage Rules
 
@@ -214,8 +229,8 @@ Leave is calculated from working sessions.
 
 A working day has two leave sessions:
 
-- `am` = 0.5 days
-- `pm` = 0.5 days
+- `am` = 1 unit = 0.5 days
+- `pm` = 1 unit = 0.5 days
 
 Valid session ranges:
 
@@ -229,6 +244,7 @@ Invalid session ranges:
 
 - `start_date > end_date`
 - Same-day `pm -> am`
+- `start_date < today`
 
 Working sessions exclude:
 
@@ -242,18 +258,26 @@ If the selected range contains no working sessions, the request is rejected.
 
 The system uses a hybrid balance model:
 
-- Creating a leave request validates against available leave but does not deduct `used_days`.
+- Creating a leave request validates against available leave but does not deduct `used_units`.
 - Available leave means remaining balance after approved usage and pending requests.
-- Approving a leave request deducts from `used_days`.
+- Approving a leave request deducts from `used_units`.
 - Rejecting a leave request does not change balance.
 - Cancelling pending leave does not change balance.
 - Cancelling approved leave restores the deducted balance.
 
 Approval re-checks balance inside the approval workflow to protect against stale pending requests and concurrent approvals.
 
+Mutation service functions should commit their own successful transactions so API routes and tests can call them directly. Approval and cancellation must update the leave request and related balance rows in the same transaction before committing.
+
+For this SQLite challenge app, concurrent approval protection is handled by re-checking request status, recalculated usage, and affected balances immediately before updating. In production with PostgreSQL, the approval workflow should lock the leave request and affected balance rows, or use optimistic version columns, so two managers cannot deduct the same balance concurrently.
+
 Cross-year leave usage is split by leave year. For example, a request from `2026-12-31 pm` to `2027-01-02 pm` consumes the 2026 and 2027 balances separately.
 
 Missing yearly balance rows are validation failures. The leave workflow does not auto-create balances because entitlement creation is an HR setup concern.
+
+Pending requests count against available leave using their stored `leave_usage_units`. For cross-year pending requests, services may recalculate the per-year split from the stored request dates and sessions because the request only stores total units. This avoids adding extra persistence for a rare case while keeping yearly balance validation correct.
+
+If recalculating a pending cross-year request produces a different total from its stored `leave_usage_units`, validation should fail with a stale leave usage conflict. The system should not silently reinterpret another pending request's reserved capacity after the employee has submitted it.
 
 ## 5. Overlap Rules
 
@@ -303,7 +327,42 @@ Cancellation transitions:
 
 Rejected and cancelled leave requests are final.
 
-## 7. Edge Cases Identified
+## 7. Error Handling
+
+The service layer should raise specific domain exception classes with a shared `LeaveError` base class. The FastAPI layer maps those exception types to user-friendly HTTP status codes.
+
+Recommended exception classes:
+
+- `EmployeeNotFoundError`
+- `LeaveRequestNotFoundError`
+- `InvalidLeavePeriodError`
+- `NoWorkingSessionsError`
+- `MissingLeaveBalanceError`
+- `InsufficientBalanceError`
+- `OverlappingLeaveError`
+- `InvalidStatusTransitionError`
+- `SelfApprovalError`
+- `ApprovalAuthorityError`
+- `CancellationAuthorityError`
+- `LeaveAlreadyStartedError`
+
+Recommended mapping:
+
+- Employee not found: `404 Not Found`
+- Leave request not found: `404 Not Found`
+- Approver not found: `404 Not Found`
+- Invalid date or session range: `422 Unprocessable Entity`
+- No working sessions in the selected range: `422 Unprocessable Entity`
+- Missing leave balance: `422 Unprocessable Entity`
+- Insufficient available leave: `422 Unprocessable Entity`
+- Overlapping leave: `409 Conflict`
+- Invalid status transition: `409 Conflict`
+- Self-approval: `403 Forbidden`
+- Non-manager approval: `403 Forbidden`
+- Non-requester cancellation: `403 Forbidden`
+- Approved leave already started: `409 Conflict`
+
+## 8. Edge Cases Identified
 
 - Half-day leave uses explicit `am` and `pm` sessions.
 - Full-day leave is represented as `am -> pm`, not as a separate API enum value.
@@ -317,12 +376,13 @@ Rejected and cancelled leave requests are final.
 - Cross-year leave validates and deducts each leave year separately.
 - Missing balance rows reject the request rather than being auto-created.
 - Approval recalculates usage and rejects if holiday/calendar changes would alter the stored usage.
+- Stale pending cross-year usage blocks new balance validation instead of being silently reinterpreted.
 
-## 8. Tradeoffs and Decisions
+## 9. Tradeoffs and Decisions
 
-### Expose days, calculate by sessions
+### Expose days, store integer units
 
-The API exposes leave usage and balances in days because that is the language employees and managers expect. Internally, the system reasons in half-day sessions so `0.5`, `1.5`, and cross-day ranges are unambiguous.
+The API exposes leave usage and balances in days because that is the language employees and managers expect. Internally, the system stores integer half-day units so `0.5`, `1.5`, and cross-day ranges are unambiguous and balance deduction avoids floating-point arithmetic.
 
 ### Use sessions instead of a `full_day` enum
 
@@ -340,16 +400,86 @@ The current employee model has a `manager_id` but no roles or permission model. 
 
 Leave usage is stored when the request is created, but approval recalculates usage before balance deduction. If the value changes, approval is rejected. This avoids silently deducting a different amount from what the employee submitted and what the manager reviewed.
 
-## 9. What I Would Do With More Time
+### Share calculation without overbuilding architecture
+
+Preview, create, overlap validation, and approval should use the same leave usage calculator so date/session/public-holiday rules cannot drift. This should be a small helper module, not a broad domain layer. The goal is to remove repeated complex calculation, not to introduce abstraction for its own sake.
+
+Date-sensitive service functions should derive the current date through a small Malaysia-timezone helper using `Asia/Kuala_Lumpur`. Those functions should accept an optional `today` parameter so tests can pass a fixed date without monkeypatching global time.
+
+### Derive working sessions instead of persisting them
+
+The system should not add a `leave_request_sessions` table for this challenge. Overlap validation should query only active leave requests whose raw date ranges could overlap, then derive working sessions from those candidates for exact session comparison. This keeps the schema simple while avoiding an employee-wide scan.
+
+## 10. What I Would Do With More Time
 
 - Add company-specific holiday calendars and state-level Malaysia holiday configuration once employees have a work location or assigned leave calendar.
 - Add role-based approval rules for HR/admin overrides.
+- Add administrative cancellation for HR or boss users once the system has an explicit role or permission model.
 - Add database-level protection for concurrent approvals, such as row locking or optimistic versioning.
 - Add audit events for approval, rejection, cancellation, and balance restoration.
 - Add a dedicated entitlement setup workflow for yearly leave balances.
 - Add calendar integration so approved leave can appear in shared calendars.
 
-## 10. Running the Project
+## 11. Test Plan
+
+Implementation should proceed with a TDD approach.
+
+Calculator tests:
+
+- Half-day AM leave consumes `0.5` days.
+- Half-day PM leave consumes `0.5` days.
+- Same-day full leave consumes `1.0` day.
+- Multi-day `pm -> am` leave is valid and consumes the expected sessions.
+- Same-day `pm -> am` leave is invalid.
+- Weekend sessions are excluded.
+- Malaysia national public holidays are excluded.
+- Cross-year leave returns usage split by year.
+- A range with no working sessions is rejected.
+
+Create request tests:
+
+- Missing sessions default to `am -> pm`.
+- Backdated `start_date` is rejected.
+- Missing employee is rejected.
+- Missing yearly balance is rejected.
+- Insufficient available leave is rejected.
+- Pending requests count against available leave.
+- Same-session overlap is rejected.
+- Different-session same-day leave is allowed.
+
+Preview tests:
+
+- Preview returns total usage, per-year usage, working sessions, and excluded dates.
+- Preview does not check balance availability.
+- Preview does not create requests or mutate balances.
+
+Review tests:
+
+- Direct manager can approve.
+- Non-manager approval is rejected.
+- Self-approval is rejected.
+- Approval deducts balance once.
+- Retrying the same approval is idempotent.
+- Retrying the same rejection is idempotent.
+- Changing a final decision is rejected.
+- Approval rejects stale leave usage if recalculation differs from stored usage.
+
+Cancellation tests:
+
+- Requester can cancel pending leave.
+- Requester can cancel approved future leave.
+- Cancelling approved leave restores balance.
+- Requester cannot cancel approved leave that has started.
+- Non-requester cancellation is rejected.
+- Rejected and cancelled leave requests cannot be cancelled again.
+
+Listing and balance tests:
+
+- Leave request filters work by employee, status, leave type, and date range.
+- Pagination returns items and total count.
+- Balance responses expose days converted from integer units.
+
+## 12. Running the Project
 
 ```bash
 # Install
